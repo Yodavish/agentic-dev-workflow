@@ -265,6 +265,67 @@ class WorktreeManager:
             "cleanup", True, run_id, str(source), str(destination), base_commit, False, ()
         )
 
+    def verify_managed_worktree(
+        self,
+        source_repository: str | Path,
+        base_commit: str,
+        *,
+        run_id: str,
+        require_clean: bool = True,
+    ) -> WorktreeOperationResult:
+        """Verify ownership and registration, optionally requiring a clean worktree."""
+        if not self._valid_run_id(run_id):
+            return self._failure(
+                "verify", source_repository, run_id, base_commit, "run_id is invalid"
+            )
+        baseline = verify_git_baseline(
+            source_repository,
+            base_commit,
+            require_clean=True,
+            timeout_seconds=self.timeout_seconds,
+        )
+        if not baseline.success:
+            return self._result(
+                "verify", False, run_id, baseline.source_path or str(source_repository), "",
+                base_commit, False, baseline.issues,
+            )
+        source = Path(baseline.source_path)
+        root, root_issue = self._existing_owned_root(source)
+        destination = root / f"agentic-workflow-{run_id}" if root else Path()
+        if root_issue:
+            return self._result(
+                "verify", False, run_id, str(source), str(destination), base_commit,
+                os.path.lexists(destination), (root_issue,),
+            )
+        assert root is not None
+        owner, owner_issue = self._read_manifest(self._manifest_path(root, run_id))
+        if owner_issue:
+            return self._result(
+                "verify", False, run_id, str(source), str(destination), base_commit,
+                os.path.lexists(destination), (owner_issue,),
+            )
+        expected = {
+            "run_id": run_id,
+            "source_repository": str(source),
+            "worktree_path": str(destination),
+            "base_commit": baseline.resolved_commit,
+        }
+        if any(owner.get(key) != value for key, value in expected.items()):
+            return self._result(
+                "verify", False, run_id, str(source), str(destination), base_commit,
+                True, ("manager ownership record does not match the requested run and source",),
+            )
+        issues = self._verify_worktree(
+            source,
+            destination,
+            baseline.resolved_commit or "",
+            require_clean=require_clean,
+        )
+        return self._result(
+            "verify", not issues, run_id, str(source), str(destination),
+            baseline.resolved_commit or base_commit, bool(issues), tuple(issues),
+        )
+
     def _prepare_owned_root(self, source: Path) -> tuple[Path | None, str | None]:
         root, issue = self._canonical_root(source)
         if issue:
@@ -341,7 +402,12 @@ class WorktreeManager:
         return common == first or common == second
 
     def _verify_worktree(
-        self, source: Path, destination: Path, expected_commit: str
+        self,
+        source: Path,
+        destination: Path,
+        expected_commit: str,
+        *,
+        require_clean: bool = True,
     ) -> list[str]:
         issues: list[str] = []
         if destination.is_symlink() or not destination.is_dir():
@@ -362,8 +428,8 @@ class WorktreeManager:
             issues.append("worktree is not associated with the selected source repository")
         if not self._listed_worktree(source, resolved_destination, expected_commit):
             issues.append("source repository does not list this run worktree and base commit")
-        if not self._worktree_is_clean(resolved_destination):
-            issues.append("new worktree is not clean")
+        if require_clean and not self._worktree_is_clean(resolved_destination):
+            issues.append("worktree is not clean")
         return issues
 
     def _common_git_dir(self, repository: Path) -> Path | None:

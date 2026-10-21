@@ -54,9 +54,11 @@ Reserved process configuration keys are rejected from structured context too.
 
 `AgentAdapter` is a provider-neutral synchronous protocol. `MockAgentAdapter`
 returns configurable deterministic success or failure results without I/O.
-`DisabledCodexAdapter` always rejects the request. No real Codex adapter is
-enabled, and the Phase 3A LangGraph nodes do not use these adapters implicitly.
-The planner, mock executor, and verifier remain local deterministic nodes.
+`CodexCLIAdapter` implements a guarded subprocess adapter (Phase 3B-3), while
+`DisabledCodexAdapter` remains an always-rejecting placeholder. The real
+adapter is disabled by default, is not exposed through the CLI, and is not
+connected to LangGraph. The Phase 3A planner, mock executor, and verifier
+remain local deterministic nodes.
 
 The safe telemetry helper emits only run ID, role, attempt, adapter type,
 status, failure category, and elapsed duration. It omits task text, context,
@@ -79,11 +81,13 @@ symlinks, or that the worktree is actually isolated. Later Git/filesystem
 integration must verify a clean base commit and the real worktree boundary
 before any write. No policy check accesses the filesystem or invokes Git.
 
-Before real execution, a later phase must define and review an explicitly
-bounded Codex adapter, verify the selected commit and dedicated worktree,
-enforce human approval and operating-system permissions, test timeout and
-cancellation behavior, and preserve the existing telemetry allowlist. This
-phase supplies contracts only; it does not authorize or perform execution.
+The Codex adapter checks these declarations in Python and verifies a clean
+source baseline plus the manager-owned worktree association before launch. The
+worktree may become dirty after execution so a repair attempt can reuse it.
+Fields forbidding commits, merges, deployment, production database access, and
+destructive cleanup are validated declarations; they are not command-level
+enforcement. End-to-end workflow orchestration, human approval UX, and an
+OS-enforced sandbox remain future work.
 
 ## Setup and tests
 
@@ -145,6 +149,82 @@ outcome, and mock-mode attributes. Specification text, plan content, source,
 diffs, credentials, and environment values are not span attributes. Search
 Jaeger for `workflow.mock-run` and inspect its child spans.
 
+## Controlled Codex CLI adapter (Phase 3B-3)
+
+The installed CLI was inspected locally and reported `codex-cli 0.163.0`.
+Its `codex exec --help` confirms non-interactive execution, `--cd`,
+`--sandbox read-only|workspace-write`, `--ask-for-approval on-request`,
+`--json`, and `--output-schema`. It also supports `--oss --local-provider
+ollama`. This adapter pins runtime acceptance to that exact version and fails
+closed for missing, unlaunchable, or different versions. Recheck the installed
+help and review the adapter before upgrading Codex.
+
+Every adapter run uses local Ollama mode, an isolated temporary Codex home,
+`--ignore-user-config`, `--ephemeral`, no web search, and a minimal child
+environment that excludes caller credentials and API-key variables. Set
+`AGENTIC_DEV_WORKFLOW_CODEX_EXECUTABLE` to an absolute, normalized executable
+path; the adapter does not search ambient `PATH` for Codex. Planner
+and reviewer roles use the `read-only` sandbox; executor uses `workspace-write`.
+Every role requests `on-request` approval. It never uses bypass flags, adds
+directories, or accepts an executable, working directory, sandbox, approval
+setting, or command arguments from the request. The request prompt is sent on
+stdin and is not written to logs or telemetry. An absolute path and matching
+version string do not authenticate the binary: the configured file, its
+interpreter/runtime, and command resolution through the child `PATH` remain
+local trust assumptions.
+
+The CLI help does not provide an execution timeout option. The Python wrapper
+uses one deadline for version probing and agent execution, with bounded
+termination and stream-cleanup grace. It terminates the Codex process group on
+POSIX; on Windows it fails closed because this implementation cannot verify
+process-tree cleanup. POSIX cleanup kills descendants that remain in the
+Codex process group; a process that deliberately creates a new session can
+escape that group, so this is not a substitute for an OS sandbox. It caps
+combined stdout/stderr capture at 1 MiB by default
+(constructor limits: 1 KiB through 16 MiB). It parses JSONL completion events
+and validates a bounded Codex-specific response with exactly `summary` and
+`items` fields. The structured message is limited to 64 KiB; summaries to 2,048
+characters; and items to 64 strings of at most 512 characters each. The
+generic `AgentResult.structured_output` mapping contract is unchanged, but the
+Codex response shape is intentionally narrower than the earlier arbitrary
+object. The schema constrains shape and size only; it does not detect secrets.
+Returned structured values are model-generated, untrusted, and potentially
+sensitive. Full JSONL output and stderr are not returned; rejected-output
+diagnostics and telemetry omit their values.
+
+Executor runs use strict CLI configuration overrides to disable workspace
+network access, set additional writable roots to an empty list, and exclude
+`/tmp` and `TMPDIR` from workspace writes. Startup update checks and Codex
+analytics are also disabled. These CLI sandbox settings constrain Codex's
+execution environment; they are not a complete host security boundary. The
+sandbox and analytics keys are listed in the
+[Codex configuration reference](https://developers.openai.com/codex/config-reference).
+
+The prompt asks Codex not to commit, merge, deploy, access production databases,
+or perform destructive cleanup. These instructions are advisory. Python
+validates that corresponding policy flags are false, but this phase does not
+independently block those actions. `on-request` approval and the CLI sandbox
+remain Codex controls, not a separate runner approval UI or OS sandbox.
+
+Codex execution requires `AGENTIC_DEV_WORKFLOW_CODEX_ENABLED=true` through
+validated configuration and direct construction of `CodexCLIAdapter` with an
+`ExecutionPolicy` and `WorktreeManager`. The adapter then verifies the clean
+source baseline, manager ownership record, linked Git worktree, selected
+commit, and run ID before launch. Worktree checks are repeated after the
+version probe, but are not race-free against a concurrent same-user process.
+The manifest and marker prevent accidental reuse, not a malicious same-user
+process. Strong isolation requires an OS sandbox or stronger architecture.
+No existing CLI command or LangGraph node
+constructs it, so opt-in configuration alone does not start an agent.
+
+Tests exercise process handling with a fake Codex executable and temporary
+Git fixtures only. They do not invoke the installed Codex agent or call a
+model. The installed adapter is deliberately not run against an application
+repository in this phase. Local Ollama inference avoids a paid model API, but
+requires an available local Ollama service and compatible model; hardware and
+electricity costs still apply. The Codex sandbox and Git worktree are not a
+complete OS security sandbox, and configured Git filters remain a concern.
+
 ## Git baseline verification and worktrees (Phase 3B-2)
 
 `baseline-check` requires an explicit source repository and full commit ID. It
@@ -180,10 +260,10 @@ until those checkout operations run under a reviewed OS sandbox.
 
 All integration tests create temporary Git repositories. No real user project
 is used by these tests. The Dashboard is outside this phase's code and test
-scope. No real Codex adapter is enabled; the disabled placeholder remains
-disabled. Before any real agent runs, a later phase must add explicit process
-permissions/sandbox enforcement, approval gates, bounded execution and
-cancellation, and actual isolated-worktree checks under the reviewed policy.
+scope. Phase 3B-2 had no real Codex adapter; Phase 3B-3 adds one that remains
+opt-in and disconnected from the CLI and LangGraph. Before autonomous workflow
+execution, a later phase must add explicit approval UX, independent OS sandbox
+enforcement, bounded orchestration/retries, and review of worktree changes.
 
 ## Jaeger
 
@@ -201,10 +281,12 @@ Open <http://localhost:16686>. The default trace endpoint is
 ## Safety and limitations
 
 - Phase 3A does not access, inspect, or modify the Dashboard repository.
-- There is no Codex or other agent invocation, model call, agent shell
-  execution, real verification, or automated commit. The explicit Phase 3B-2
-  worktree command is the only added Git mutation; it operates on the
-  explicitly selected disposable source and run-owned worktree only.
+- Existing CLI commands and LangGraph workflows do not invoke Codex or a model.
+  The separate adapter can only run after explicit validated opt-in and
+  direct construction; this phase's tests use a fake executable and no model.
+  No agent shell task or real verification is wired into autonomous workflow
+  execution, and there is no automated commit. The Phase 3B-2 worktree command
+  remains the only CLI Git mutation.
 - `run` remains a dry-run/preflight command only. Future implementation must
   require an explicitly selected base commit and use a separate worktree.
 - `doctor` checks local tools and endpoint reachability; it does not verify

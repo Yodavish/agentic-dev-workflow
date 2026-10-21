@@ -1,0 +1,29 @@
+{
+  "type": "object",
+  "properties": {
+    "output": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "string",
+          "description": "Short untrusted summary; may contain sensitive content.",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "items": {
+          "type": "array",
+          "description": "Bounded list of untrusted plan, action, or review items.",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "maxLength": 512
+          }
+        }
+      },
+      "required": ["summary", "items"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["output"],
+  "additionalProperties": false
+}
