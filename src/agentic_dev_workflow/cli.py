@@ -15,7 +15,11 @@ from urllib.parse import urlsplit
 
 from opentelemetry.trace import Status, StatusCode
 
-from agentic_dev_workflow.config import Configuration, ConfigurationError
+from agentic_dev_workflow.checkpointing import (
+    CheckpointStorageError,
+    open_sqlite_checkpointer,
+)
+from agentic_dev_workflow.config import Configuration, ConfigurationError, resolve_data_dir
 from agentic_dev_workflow.git_safety import verify_git_baseline
 from agentic_dev_workflow.mock_workflow import MockScenario, run_mock_workflow
 from agentic_dev_workflow.tracing import create_tracing_session, new_run_id
@@ -39,6 +43,25 @@ def _parser() -> argparse.ArgumentParser:
     demo.add_argument("--max-retries", type=int, default=1, help="Repair retries after the first attempt (0-2)")
     demo.add_argument("--no-tracing", action="store_true", help="Run without exporting telemetry")
     demo.add_argument("--otlp-endpoint", help="OTLP HTTP trace endpoint")
+    demo.add_argument(
+        "--durable",
+        action="store_true",
+        help="Persist this mock run in runner-owned SQLite storage",
+    )
+    demo.add_argument(
+        "--data-dir",
+        help="Runner-owned data directory (or AGENTIC_DEV_WORKFLOW_DATA_DIR)",
+    )
+    demo.add_argument(
+        "--pause-after-planning",
+        action="store_true",
+        help="Persist planner output and exit before mock execution",
+    )
+    demo.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a matching paused SQLite-backed mock run",
+    )
 
     baseline = commands.add_parser("baseline-check", help="Verify an explicit Git baseline")
     baseline.add_argument("--repository", required=True, help="Explicit source Git worktree root")
@@ -109,35 +132,89 @@ def main(argv: list[str] | None = None) -> int:
 
 def _workflow_demo(arguments: argparse.Namespace) -> int:
     """Run only deterministic mock nodes; this command never loads repository config."""
+    if arguments.pause_after_planning and arguments.resume:
+        print(
+            "workflow configuration error: pause and resume cannot be combined",
+            file=sys.stderr,
+        )
+        return 2
+    if (arguments.pause_after_planning or arguments.resume) and not arguments.run_id:
+        print(
+            "workflow configuration error: pause and resume require an explicit --run-id",
+            file=sys.stderr,
+        )
+        return 2
+    durable = (
+        arguments.durable
+        or arguments.data_dir is not None
+        or arguments.pause_after_planning
+        or arguments.resume
+    )
     session = None
     telemetry_error = None
+    config = None
+    data_dir = None
     if not arguments.no_tracing:
         try:
-            config = Configuration.from_values(repository=".", otlp_endpoint=arguments.otlp_endpoint)
+            config = Configuration.from_values(
+                repository=".",
+                otlp_endpoint=arguments.otlp_endpoint,
+            )
         except ConfigurationError as error:
             print(f"configuration error: {error}", file=sys.stderr)
             return 2
+    if durable:
         try:
+            data_dir = resolve_data_dir(arguments.data_dir)
+        except ConfigurationError as error:
+            print(f"configuration error: {error}", file=sys.stderr)
+            return 2
+    if not arguments.no_tracing:
+        try:
+            assert config is not None
             session = create_tracing_session(config.otlp_endpoint)
         except Exception as error:
             telemetry_error = f"tracing setup failed ({type(error).__name__})"
     run_id = arguments.run_id or new_run_id()
     try:
-        result = run_mock_workflow(
-            "Synthetic demo specification for a small status indicator.",
-            scenario=arguments.scenario,
-            run_id=run_id,
-            max_retries=arguments.max_retries,
-            tracing_session=session,
-        )
+        run_options = {
+            "scenario": arguments.scenario,
+            "run_id": run_id,
+            "max_retries": arguments.max_retries,
+            "tracing_session": session,
+            "resume": arguments.resume,
+        }
+        if arguments.pause_after_planning:
+            run_options["interrupt_before"] = ["mock_executor"]
+        if durable:
+            assert data_dir is not None
+            with open_sqlite_checkpointer(
+                data_dir,
+                require_existing=arguments.resume,
+            ) as saver:
+                result = run_mock_workflow(
+                    "Synthetic demo specification for a small status indicator.",
+                    checkpointer=saver,
+                    **run_options,
+                )
+        else:
+            result = run_mock_workflow(
+                "Synthetic demo specification for a small status indicator.",
+                **run_options,
+            )
         if session is not None and not session.flush():
             telemetry_error = "trace export failed or could not be confirmed"
         report = {
             "run_id": result["run_id"],
             "scenario": result["scenario"],
-            "final_status": result["final_status"],
+            "final_status": (
+                "paused"
+                if result["final_status"] == "running"
+                else result["final_status"]
+            ),
             "execution_attempts": result["execution_attempt"],
             "repair_retries_used": result["repair_retries_used"],
+            "attempt_history_entries": len(result["attempt_history"]),
             "simulated": True,
             "verification_summary": result["verification_summary"],
             "telemetry_error": telemetry_error,
@@ -145,10 +222,13 @@ def _workflow_demo(arguments: argparse.Namespace) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
         if telemetry_error:
             print(f"observability warning: {telemetry_error}", file=sys.stderr)
-        return 0 if result["final_status"] == "success" else 1
+        return 0 if result["final_status"] in {"success", "running"} else 1
     except ValueError as error:
         print(f"workflow configuration error: {error}", file=sys.stderr)
         return 2
+    except CheckpointStorageError as error:
+        print(f"checkpoint error: {error}", file=sys.stderr)
+        return 1
     finally:
         if session is not None:
             try:

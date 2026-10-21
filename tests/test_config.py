@@ -1,14 +1,11 @@
 import unittest
 from pathlib import Path
-from unittest.mock import patch
-
 from agentic_dev_workflow.config import Configuration, ConfigurationError
 
 
 class ConfigurationTests(unittest.TestCase):
     def test_defaults_to_dashboard_path_and_local_jaeger_endpoint(self) -> None:
-        with patch.object(Path, "resolve", side_effect=AssertionError("filesystem access")):
-            config = Configuration.from_values()
+        config = Configuration.from_values(environ={"XDG_DATA_HOME": "/tmp/xdg"})
         self.assertEqual(
             str(config.repository),
             "/home/dvit/projects/politician-dashboard",
@@ -17,6 +14,30 @@ class ConfigurationTests(unittest.TestCase):
             config.otlp_endpoint,
             "http://localhost:4318/v1/traces",
         )
+        self.assertEqual(config.data_dir, Path("/tmp/xdg/agentic-dev-workflow"))
+
+    def test_data_directory_defaults_to_home_local_share(self) -> None:
+        config = Configuration.from_values(environ={"HOME": "/tmp/test-home"})
+        self.assertEqual(
+            config.data_dir,
+            Path("/tmp/test-home/.local/share/agentic-dev-workflow"),
+        )
+
+    def test_data_directory_override_is_canonical_and_explicit(self) -> None:
+        config = Configuration.from_values(
+            data_dir="/tmp/runner-data/../runner-data",
+            environ={},
+        )
+        self.assertEqual(config.data_dir, Path("/tmp/runner-data"))
+
+    def test_rejects_relative_or_empty_data_directory(self) -> None:
+        for value in ("relative/path", ""):
+            with self.subTest(value=value), self.assertRaises(ConfigurationError):
+                Configuration.from_values(data_dir=value, environ={})
+
+    def test_rejects_relative_xdg_data_home(self) -> None:
+        with self.assertRaises(ConfigurationError):
+            Configuration.from_values(environ={"XDG_DATA_HOME": "relative"})
 
     def test_accepts_valid_explicit_configuration(self) -> None:
         config = Configuration.from_values(

@@ -33,14 +33,62 @@ simulated failure messages remain in final state.
 
 ## Checkpointing
 
-The graph uses LangGraph's `InMemorySaver` by default. Every run gets a
-run-specific thread ID (`agentic-dev-workflow:<run_id>`). Tests pause before
-the executor, read the saved checkpoint, verify its run ID and SHA-256 hash of
-the specification, then resume that thread. Completed nodes are not repeated.
-The resume helper rejects a changed run ID, thread ID, or specification.
+The Python workflow API keeps `InMemorySaver` as its default for fast tests and
+explicit saver injection. `workflow-demo --durable` uses the synchronous
+`SqliteSaver` from the pinned `langgraph-checkpoint-sqlite==3.1.2` package.
+Its stable database filename is `checkpoints.sqlite3`; the default directory
+is `${XDG_DATA_HOME:-~/.local/share}/agentic-dev-workflow`. Set
+`AGENTIC_DEV_WORKFLOW_DATA_DIR` or pass `--data-dir` to select another absolute
+directory; passing `--data-dir` to `workflow-demo` opts that invocation into
+durable storage. The configured directory is canonicalized. Newly created
+directory and database files use restrictive permissions where supported. Existing
+directories or databases with broad POSIX permissions are rejected without
+changing their permissions. The database and its WAL/SHM sidecars are never
+deleted or reset automatically.
+Canonical-path resolution and symlink/permission checks reduce accidental
+misconfiguration, but they are not a complete defense against a concurrent
+same-user path-swap race. Use a trusted runner-owned directory; this storage
+layer does not provide race-free filesystem isolation.
 
-In-memory checkpoints exist only in the current process and are not durable
-across restarts. Phase 3A does not add SQLite or any runner-owned data files.
+Checkpoint state includes the synthetic specification, plan, run metadata,
+attempt history, and errors. Treat the database as local workflow data, not a
+secret store. The default location is outside application repositories. If a
+custom data directory is chosen, ensure it is runner-owned and protected.
+
+To pause after the planner checkpoint and exit before mock execution, then
+resume from that checkpoint in a later process:
+
+```bash
+uv run agentic-dev-workflow workflow-demo --run-id demo-001 \
+  --scenario retry-success --max-retries 1 --pause-after-planning --no-tracing
+
+uv run agentic-dev-workflow workflow-demo --run-id demo-001 \
+  --scenario retry-success --max-retries 1 --resume --no-tracing
+```
+
+Pause and resume require an explicit run ID and use SQLite automatically. The
+resume operation checks the namespaced thread ID, run ID, SHA-256 specification
+hash, checkpoint format version, scenario, and retry limit before running any
+node. It also validates the saved plan, state types, graph continuation, and
+attempt/retry history against the mock scenario. Missing checkpoints, terminal
+runs, corrupt databases, and incompatible state fail without starting a fresh
+run. Corrupt or incompatible files are
+preserved; stop runner processes before inspecting or backing up the database.
+Use SQLite integrity checks or a SQLite backup while the runner is stopped;
+avoid selecting serialized checkpoint blobs because they contain workflow
+state. The saver owns its table setup and schema migrations; existing files
+without the expected LangGraph tables are rejected instead of initialized.
+Application state carries format version `1`, and unknown versions are rejected
+before node execution. Back up the database before changing the locked saver
+version. This phase does not provide a database repair or deletion command.
+
+SQLite checkpointing initially supports serial run/resume operations. SQLite
+locking and the configured five-second busy timeout bound lock waits, but this
+does not provide multi-process workflow coordination. Do not run two commands
+against the same checkpoint database concurrently. Checkpoints persist graph
+state and completed-node boundaries; they do not guarantee exactly-once
+external side effects if a future node acts externally and the process stops
+before its checkpoint is committed.
 
 ## Agent adapter contracts (Phase 3B-1)
 
@@ -120,6 +168,9 @@ uv run agentic-dev-workflow workflow-demo --scenario exhausted-retries --max-ret
 # Set an explicit run ID, disable export, or configure another local endpoint
 uv run agentic-dev-workflow workflow-demo --scenario success --run-id demo-001 --no-tracing
 uv run agentic-dev-workflow workflow-demo --otlp-endpoint http://localhost:4318/v1/traces
+
+# Durable mock run; pause/resume as shown above
+uv run agentic-dev-workflow workflow-demo --durable --run-id durable-demo
 
 # Select a repository explicitly for read-only preflight
 uv run agentic-dev-workflow preflight --repository /path/to/repository

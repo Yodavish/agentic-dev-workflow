@@ -124,6 +124,23 @@ class CliTests(unittest.TestCase):
         self.assertIn('"final_status": "failed"', output.getvalue())
         self.assertIn('"repair_retries_used": 0', output.getvalue())
 
+    def test_workflow_demo_data_directory_selects_durable_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory) / "runner-data"
+            with redirect_stdout(io.StringIO()):
+                status = main(
+                    [
+                        "workflow-demo",
+                        "--run-id",
+                        "durable-cli-case",
+                        "--data-dir",
+                        str(data_dir),
+                        "--no-tracing",
+                    ]
+                )
+            self.assertEqual(status, 0)
+            self.assertTrue((data_dir / "checkpoints.sqlite3").is_file())
+
     def test_baseline_check_command_requires_and_verifies_temporary_repository(self) -> None:
         from test_git_worktrees import init_repository
 

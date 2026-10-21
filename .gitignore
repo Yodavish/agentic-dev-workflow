@@ -14,12 +14,11 @@ wheels/
 .env.*
 !.env.example
 
-# Local runtime data and checkpoints
-data/
-checkpoints/
-*.sqlite
-*.sqlite3
-*.db
+# Runner-owned SQLite checkpoint files if the data directory is explicitly
+# configured to this repository root.
+/checkpoints.sqlite3
+/checkpoints.sqlite3-wal
+/checkpoints.sqlite3-shm
 
 # Test and tool caches
 .pytest_cache/
