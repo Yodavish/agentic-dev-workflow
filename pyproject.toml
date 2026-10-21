@@ -1,0 +1,22 @@
+[project]
+name = "agentic-dev-workflow"
+version = "0.1.0"
+description = "Safety-first local agentic development workflow diagnostics"
+readme = "README.md"
+authors = [
+    { name = "Yodavish", email = "tranvu52@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "langgraph>=1.2.16",
+    "opentelemetry-api>=1.45.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.1",
+    "opentelemetry-sdk>=1.45.1",
+]
+
+[project.scripts]
+agentic-dev-workflow = "agentic_dev_workflow.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
