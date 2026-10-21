@@ -124,6 +124,76 @@ class CliTests(unittest.TestCase):
         self.assertIn('"final_status": "failed"', output.getvalue())
         self.assertIn('"repair_retries_used": 0', output.getvalue())
 
+    def test_baseline_check_command_requires_and_verifies_temporary_repository(self) -> None:
+        from test_git_worktrees import init_repository
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory) / "source"
+            commit = init_repository(repository)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                status = main(
+                    ["baseline-check", "--repository", str(repository), "--base-commit", commit]
+                )
+        self.assertEqual(status, 0)
+        self.assertIn('"resolved_commit"', output.getvalue())
+        self.assertIn('"success": true', output.getvalue())
+
+    def test_worktree_cli_requires_explicit_action_and_operates_on_temporary_repo(self) -> None:
+        from test_git_worktrees import init_repository
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = root / "source"
+            commit = init_repository(repository)
+            manager_root = root / "managed-worktrees"
+            output = io.StringIO()
+            with redirect_stdout(output):
+                create_status = main(
+                    [
+                        "worktree",
+                        "--action",
+                        "create",
+                        "--source-repository",
+                        str(repository),
+                        "--base-commit",
+                        commit,
+                        "--run-id",
+                        "cli-run",
+                        "--worktree-root",
+                        str(manager_root),
+                    ]
+                )
+            self.assertEqual(create_status, 0)
+            self.assertTrue((manager_root / "agentic-workflow-cli-run").is_dir())
+            output = io.StringIO()
+            with redirect_stdout(output):
+                cleanup_status = main(
+                    [
+                        "worktree",
+                        "--action",
+                        "cleanup",
+                        "--source-repository",
+                        str(repository),
+                        "--base-commit",
+                        commit,
+                        "--run-id",
+                        "cli-run",
+                        "--worktree-root",
+                        str(manager_root),
+                    ]
+                )
+        self.assertEqual(cleanup_status, 0)
+        self.assertIn('"success": true', output.getvalue())
+        self.assertFalse((manager_root / "agentic-workflow-cli-run").exists())
+
+    def test_worktree_cli_rejects_omitted_action(self) -> None:
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            status = main(["worktree", "--repository", "/tmp/source"])
+        self.assertEqual(status, 2)
+        self.assertIn("--action", errors.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

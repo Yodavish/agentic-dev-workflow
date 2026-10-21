@@ -10,14 +10,17 @@ import socket
 import subprocess
 import sys
 from dataclasses import asdict
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from opentelemetry.trace import Status, StatusCode
 
 from agentic_dev_workflow.config import Configuration, ConfigurationError
+from agentic_dev_workflow.git_safety import verify_git_baseline
 from agentic_dev_workflow.mock_workflow import MockScenario, run_mock_workflow
 from agentic_dev_workflow.tracing import create_tracing_session, new_run_id
 from agentic_dev_workflow.workflow import WorkflowResult, run_preflight
+from agentic_dev_workflow.worktrees import WorktreeManager
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -36,6 +39,19 @@ def _parser() -> argparse.ArgumentParser:
     demo.add_argument("--max-retries", type=int, default=1, help="Repair retries after the first attempt (0-2)")
     demo.add_argument("--no-tracing", action="store_true", help="Run without exporting telemetry")
     demo.add_argument("--otlp-endpoint", help="OTLP HTTP trace endpoint")
+
+    baseline = commands.add_parser("baseline-check", help="Verify an explicit Git baseline")
+    baseline.add_argument("--repository", required=True, help="Explicit source Git worktree root")
+    baseline.add_argument("--base-commit", required=True, help="Full 40- or 64-character commit ID")
+
+    worktree = commands.add_parser(
+        "worktree", help="Explicitly create or clean up a manager-owned temporary worktree"
+    )
+    worktree.add_argument("--action", choices=("create", "cleanup"), required=True)
+    worktree.add_argument("--source-repository", required=True, help="Explicit source Git worktree root")
+    worktree.add_argument("--base-commit", required=True, help="Full 40- or 64-character commit ID")
+    worktree.add_argument("--run-id", required=True, help="Safe dedicated workflow run ID")
+    worktree.add_argument("--worktree-root", required=True, help="Explicit runner-owned worktree root")
     return parser
 
 
@@ -48,6 +64,28 @@ def main(argv: list[str] | None = None) -> int:
         return int(error.code)
     if arguments.command == "workflow-demo":
         return _workflow_demo(arguments)
+    if arguments.command == "baseline-check":
+        result = verify_git_baseline(arguments.repository, arguments.base_commit)
+        report = asdict(result)
+        report["success"] = result.success
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if result.success else 1
+    if arguments.command == "worktree":
+        manager = WorktreeManager(arguments.worktree_root)
+        if arguments.action == "create":
+            result = manager.create_worktree(
+                arguments.source_repository,
+                arguments.base_commit,
+                run_id=arguments.run_id,
+            )
+        else:
+            result = manager.cleanup_worktree(
+                arguments.source_repository,
+                arguments.base_commit,
+                run_id=arguments.run_id,
+            )
+        print(json.dumps(asdict(result), indent=2, sort_keys=True))
+        return 0 if result.success else 1
     try:
         config = Configuration.from_values(arguments.repository, arguments.otlp_endpoint)
     except ConfigurationError as error:
@@ -229,7 +267,13 @@ def _tool_version(executable: str, argument: str) -> dict[str, object]:
         return {"available": False}
     try:
         result = subprocess.run(
-            [path, argument], capture_output=True, text=True, timeout=5, check=False
+            [path, argument],
+            cwd=Path.cwd(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            shell=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return {"available": False}

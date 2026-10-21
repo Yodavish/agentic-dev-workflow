@@ -7,13 +7,14 @@ from agentic_dev_workflow.git_safety import inspect_repository
 
 
 def init_repository(path: Path) -> None:
-    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True, timeout=10)
     (path / "tracked.txt").write_text("base", encoding="utf-8")
-    subprocess.run(["git", "-C", str(path), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "add", "tracked.txt"], cwd=path, check=True, timeout=10)
     subprocess.run(
-        ["git", "-C", str(path), "-c", "user.name=Test", "-c",
+        ["git", "-c", "user.name=Test", "-c",
          "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base"],
-        check=True,
+        cwd=path, check=True, timeout=10,
     )
 
 
