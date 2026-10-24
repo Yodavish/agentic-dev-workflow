@@ -1,347 +1,145 @@
-# Agentic Development Workflow
+# Agentic Dev Workflow
 
-A local runner foundation for a future feature implementation workflow. This
-repository is separate from the Politician Dashboard checkout.
+An agent that can edit a repository can also report success for a change it did not make, a file nobody approved, or a check that never ran. This repository is a local control loop that keeps those outcomes apart.
 
-## Architecture and phase boundaries
+A planner may name files. Execution waits until a person approves that exact set. Git then reports the paths that actually changed. Registered checks run through a sandbox contract. A separate reviewer sees the check result. A failed check or a rejected review can be repaired at most twice. Reviewer approval cannot turn a failed check into success.
 
-Phase 2 provides configuration, read-only Git preflight, CLI diagnostics, and
-short-lived OpenTelemetry export. Phase 3A adds a `StateGraph` to exercise
-workflow routing and checkpoint behavior without any autonomous actions.
-LangGraph is used for explicit state, conditional transitions, and checkpoints;
-no model provider or LangSmith dependency is present.
+The orchestration graph composes those contracts with mock agents and an in-memory sandbox. The command-line demo still runs an older mock graph. Neither path calls a live model.
 
-The mocked graph is:
+## Orchestration lifecycle
 
-```text
-START → planner → mock_executor → verifier → retry_decision
-                         ↑                         │
-                         └──── bounded retry ─────┘
+```mermaid
+flowchart TD
+  spec[Specification] --> plan[Validate planner output]
+  plan -->|invalid plan| haltPlan[Stop before execution]
+  plan -->|proposed file set| approval[Compare explicit approval]
+  approval -->|missing or different set| haltApproval[Stop before the executor]
+  approval -->|exact set match| execute[Invoke executor]
+  execute -->|output fails validation| haltExecute[Count the invocation and stop]
+  execute -->|completed output| inventory[Read Git inventory]
+  inventory --> scope[Enforce approved scope]
+  scope -->|incomplete inventory or path outside the set| haltScope[Stop before sandbox checks]
+  scope -->|every changed path approved| checks[Run registered checks]
+  checks -->|verification error| haltError[Stop with no repair]
+  checks -->|pass or fail| review[Independent review]
+  review --> decide[Decide from bindings]
+  decide -->|pass, approve, and intact evidence| success[Success report]
+  decide -->|fail or reject, repair budget remains| execute
+  decide -->|repair budget spent| failed[Failed report]
 ```
 
-All three work nodes are deterministic simulations. The planner returns a
-fixed structured plan and does not inspect a repository. The executor changes
-only graph state; it runs no commands and writes no files. The verifier derives
-its simulated outcome from the selected scenario and explicitly says that no
-real tests or checks ran.
+A checkpoint may pause before execution, verification, review, or the decision. Resume checks the saved specification, retry limit, repository root, approved set, and evidence bindings before the graph continues.
 
-`max_retries` counts repair attempts after the initial execution. It is
-validated as an integer from 0 through 2, so a run can make at most three
-execution attempts. A failed verification retries the mock executor while
-repairs remain; otherwise the graph terminates as failed. Attempt history and
-simulated failure messages remain in final state.
+## Architecture
 
-## Checkpointing
+`run_orchestration` is the workflow caller. Each stage returns a validated result or stops. A later stage does not reinterpret an earlier failure as success.
 
-The Python workflow API keeps `InMemorySaver` as its default for fast tests and
-explicit saver injection. `workflow-demo --durable` uses the synchronous
-`SqliteSaver` from the pinned `langgraph-checkpoint-sqlite==3.1.2` package.
-Its stable database filename is `checkpoints.sqlite3`; the default directory
-is `${XDG_DATA_HOME:-~/.local/share}/agentic-dev-workflow`. Set
-`AGENTIC_DEV_WORKFLOW_DATA_DIR` or pass `--data-dir` to select another absolute
-directory; passing `--data-dir` to `workflow-demo` opts that invocation into
-durable storage. The configured directory is canonicalized. Newly created
-directory and database files use restrictive permissions where supported. Existing
-directories or databases with broad POSIX permissions are rejected without
-changing their permissions. The database and its WAL/SHM sidecars are never
-deleted or reset automatically.
-Canonical-path resolution and symlink/permission checks reduce accidental
-misconfiguration, but they are not a complete defense against a concurrent
-same-user path-swap race. Use a trusted runner-owned directory; this storage
-layer does not provide race-free filesystem isolation.
+**Planner.** The planner returns steps. The proposed scope is the union of each step’s `expected_files`, in first-seen order. Malformed planner output stops the run before the executor.
 
-Checkpoint state includes the synthetic specification, plan, run metadata,
-attempt history, and errors. Treat the database as local workflow data, not a
-secret store. The default location is outside application repositories. If a
-custom data directory is chosen, ensure it is runner-owned and protected.
+**Approval.** The caller passes a `ScopeApproval` tuple. The approved paths must equal the proposed set. A missing approval ends at `awaiting_approval`. A wider or narrower set ends at `scope_mismatch`. Approval is a human decision recorded by the caller. The inventory module does not grant it.
 
-To pause after the planner checkpoint and exit before mock execution, then
-resume from that checkpoint in a later process:
+**Executor.** The executor receives the approved paths and the current attempt. The graph counts every call in `executor_invocations`. It opens a verification attempt only when the executor output validates as completed. Invalid output is an error on that invocation, and the sandbox does not run.
 
-```bash
-uv run agentic-dev-workflow workflow-demo --run-id demo-001 \
-  --scenario retry-success --max-retries 1 --pause-after-planning --no-tracing
+**Git change inventory.** After a completed executor result, the graph reads one `git status --porcelain=v2 -z` snapshot from the canonical worktree path on the verified handle. The read uses a scrubbed Git environment, a direct argument vector, a timeout, and an output cap. Staged, unstaged, and untracked changes are in scope. Both ends of a rename or copy count. The snapshot is a record of what Git reported. It is not an approval.
 
-uv run agentic-dev-workflow workflow-demo --run-id demo-001 \
-  --scenario retry-success --max-retries 1 --resume --no-tracing
-```
+**Approved-scope enforcement.** `validate_approved_scope` compares that snapshot to the approved tuple. One path outside the set, including a rename destination, stops the attempt with `out_of_scope` before any sandbox call. The same canonical root is passed to `lock_check_applies` when the plan includes the dependency-file check.
 
-Pause and resume require an explicit run ID and use SQLite automatically. The
-resume operation checks the namespaced thread ID, run ID, SHA-256 specification
-hash, checkpoint format version, scenario, and retry limit before running any
-node. It also validates the saved plan, state types, graph continuation, and
-attempt/retry history against the mock scenario. Missing checkpoints, terminal
-runs, corrupt databases, and incompatible state fail without starting a fresh
-run. Corrupt or incompatible files are
-preserved; stop runner processes before inspecting or backing up the database.
-Use SQLite integrity checks or a SQLite backup while the runner is stopped;
-avoid selecting serialized checkpoint blobs because they contain workflow
-state. The saver owns its table setup and schema migrations; existing files
-without the expected LangGraph tables are rejected instead of initialized.
-Application state carries format version `1`, and unknown versions are rejected
-before node execution. Back up the database before changing the locked saver
-version. This phase does not provide a database repair or deletion command.
+**Registered verification checks.** The registry fixes four check ids for this runner repository: `runner.tests`, `runner.compile`, `runner.diff-check`, and `runner.lock-check`. Each definition owns its arguments, timeout, output cap, applicability, and environment profile. The lock check applies when `pyproject.toml`, `uv.lock`, or `uv.toml` is added, deleted, changed, or is either end of a rename or copy. The check runs only from an inventory this process issued for the same repository root. A copied inventory, a deep-copied inventory, or a snapshot bridged from another root is rejected.
 
-SQLite checkpointing initially supports serial run/resume operations. SQLite
-locking and the configured five-second busy timeout bound lock waits, but this
-does not provide multi-process workflow coordination. Do not run two commands
-against the same checkpoint database concurrently. Checkpoints persist graph
-state and completed-node boundaries; they do not guarantee exactly-once
-external side effects if a future node acts externally and the process stops
-before its checkpoint is committed.
+**Independent reviewer.** The reviewer receives the verification outcome, evidence references, and attempt number. `approve` is valid only when the reviewer output contains no blocking finding. The reviewer does not see raw sandbox stdout or stderr. Those bytes stay on the sandbox result, hidden from its repr, and they are omitted from the orchestration report.
 
-## Agent adapter contracts (Phase 3B-1)
+**Bounded repair.** `max_retries` is an integer from 0 through 2. A verification `fail` or a reviewer rejection may repair while `repair_retries_used < max_retries`. Each repair repeats execution, inventory, scope, checks, and review. The approved set stays the set from the original approval. A verification `error`, including `UnavailableSandboxRunner`, is terminal and does not consume a repair.
 
-`adapters` defines typed requests and results for three roles: planner,
-executor, and reviewer. Requests carry a run ID, role, task text, structured
-context, bounded timeout (1–600 seconds), and correlation metadata. They have
-no executable path, shell, argument-vector, or environment fields. Results
-carry typed status, structured output, optional exit code, duration, a stable
-failure category, and a short diagnostic code rather than unrestricted output.
-Reserved process configuration keys are rejected from structured context too.
+**Decision and evidence.** Success requires a passing verification, an approve decision, and process-local HMAC-SHA256 bindings that still match. One binding is written only after the executor output validates. It covers the run id, repository root, attempt, invocation count, and approved paths. Another covers the verification payload. A third covers the review decision together with the latest history entry. A fourth covers the full public attempt history. Resume at `verify`, `review`, `decide`, or a later `execute` checks the bindings required for that point before `graph.invoke`. A fresh pause before the first execution requires the execution binding and the history binding to be absent.
 
-`AgentAdapter` is a provider-neutral synchronous protocol. `MockAgentAdapter`
-returns configurable deterministic success or failure results without I/O.
-`CodexCLIAdapter` implements a guarded subprocess adapter (Phase 3B-3), while
-`DisabledCodexAdapter` remains an always-rejecting placeholder. The real
-adapter is disabled by default, is not exposed through the CLI, and is not
-connected to LangGraph. The Phase 3A planner, mock executor, and verifier
-remain local deterministic nodes.
+**Checkpoints.** Orchestration state uses checkpoint format version 2. The mock graph uses format version 1 and a different thread id, `agentic-dev-workflow:{run_id}` rather than `agentic-dev-workflow:orchestration:{run_id}`. The orchestration default saver is in-memory. A caller can inject the existing SQLite saver. A checkpoint missing `execution_binding` or `history_binding` fails as incomplete while the format number stays 2. A version other than 2 is rejected as incompatible.
 
-The safe telemetry helper emits only run ID, role, attempt, adapter type,
-status, failure category, and elapsed duration. It omits task text, context,
-structured output, diagnostics, and correlation metadata.
+**Result reporting.** The report carries outcome, attempts, executor invocations, repairs used, the current checks, the review decision, errors, and per-attempt history. `attempts` counts executor completions that reached verification. Current checks belong to the latest attempt that reached verification. An inventory or scope failure on a later attempt records `not_run` and a `terminal_error` for that attempt, and leaves the earlier attempt’s checks on its own history entry.
 
-## Declared execution policy
+## Execution walkthrough
 
-`execution_policy` provides pure validation for a future execution request.
-It requires an explicit full 40-character SHA-1 or 64-character SHA-256 hex
-base commit, distinct absolute repository and worktree declarations, and a
-worktree named `agentic-workflow-<run_id>`. The declaration must require a
-clean baseline, explicitly authorize workspace writes, disable network access,
-set a timeout from 1 through 3,600 seconds, and cap retries at 2. Automatic
-commit, merge, deployment, production database access, and destructive cleanup
-are rejected.
+The deterministic demo in `scripts/demo_orchestration.py` runs three scenarios against temporary Git repositories. The approved file is `notes.txt`. The plan asks for `runner.tests` and `runner.lock-check`. Only `notes.txt` changes, so the lock check is skipped and the sandbox is asked to run `runner.tests`. The reviewer returns `approve` in every scenario. Mock agents and a scripted runner supply the results. The repository under development is not the target.
 
-These checks validate declared strings and flags only. They do not establish
-that the commit exists, that either path exists, that the paths are not
-symlinks, or that the worktree is actually isolated. Later Git/filesystem
-integration must verify a clean base commit and the real worktree boundary
-before any write. No policy check accesses the filesystem or invokes Git.
+**Success.** The sandbox returns passed on attempt 1. `max_retries` is 0. The report is `success`, with one verification attempt, one executor invocation, no repair, and review decision `approve`.
 
-The Codex adapter checks these declarations in Python and verifies a clean
-source baseline plus the manager-owned worktree association before launch. The
-worktree may become dirty after execution so a repair attempt can reuse it.
-Fields forbidding commits, merges, deployment, production database access, and
-destructive cleanup are validated declarations; they are not command-level
-enforcement. End-to-end workflow orchestration, human approval UX, and an
-OS-enforced sandbox remain future work.
+**Repair, then success.** Attempt 1 returns a failed `runner.tests` check. The reviewer still approves. The decision treats that as a verification failure and spends the one allowed repair. Attempt 2 returns passed. The report is `success`, with two attempts, two executor invocations, and `repair_retries_used` of 1. History is `fail`, then `pass`.
 
-## Setup and tests
+**Retry exhaustion.** Both attempts return a failed check. `max_retries` is 1, so the second failure has no repair left. The report is `failed`, with errors `verification_failed` and `retries_exhausted`. The executor has been called twice. The review decision on the report remains `approve`, which shows that the review did not override the checks.
 
-Python 3.14 and `uv` are expected. Dependencies are declared in `pyproject.toml`
-and locked in `uv.lock`.
+## Technical design
 
-```bash
-uv sync --locked
-uv run agentic-dev-workflow --help
-uv run python -m unittest discover -s tests -v
-```
+**Explicit contracts.** Planner, executor, verifier, and reviewer outputs pass through validators before the graph trusts them. The sandbox accepts a canonical registry definition and a `VerifiedWorktree` built from a successful manager verification record. The handle’s path must already be the canonical root. Orchestration does not create a managed worktree of its own.
 
-The test suite uses temporary Git repositories and in-memory tracing; it does
-not require Jaeger or a model.
+**Fail-closed validation.** Unknown planner fields, a non-integer retry limit, a bool used as an integer, an incomplete inventory, an unavailable sandbox, and a check result that claims `passed` with output above the registered cap are rejected. The runner boundary repeats the cap check so a backend cannot hand back an over-limit pass. A passed result also requires exit code 0, natural termination, successful cleanup, and no failure category.
 
-## CLI
+**Repository-bound inventory evidence.** Issuance attaches an HMAC over the inventory entries, the live object, and the canonical root. `lock_check_applies` recomputes that MAC. Public construction of a complete inventory is rejected. An unbound inventory cannot be used by naming a repository root after the fact.
 
-```bash
-# Existing Phase 2 diagnostics and dry-run preflight command
-uv run agentic-dev-workflow doctor
-uv run agentic-dev-workflow preflight
-uv run agentic-dev-workflow trace-smoke
-uv run agentic-dev-workflow run
+**Checkpoint integrity.** The bindings use one process-local key and canonical JSON (`sort_keys`, compact separators). `_matches` requires a string of equal length and then `hmac.compare_digest`. Edited counters, a rewritten earlier history entry, a reordered history, or a dropped binding fail the resume check before the executor, reviewer, or sandbox runs again. `decide` also requires the bindings before it reports success.
 
-# Deterministic mock scenarios; tracing exports to local Jaeger by default
-uv run agentic-dev-workflow workflow-demo --scenario success
-uv run agentic-dev-workflow workflow-demo --scenario retry-success --max-retries 1
-uv run agentic-dev-workflow workflow-demo --scenario exhausted-retries --max-retries 2
+**Bounded retries.** The sandbox attempt id is capped at 3, so the repair budget stops at 2. The limit is checked before the graph starts and again on resume. Raising `max_retries` at resume time, or presenting a different approval or root, is rejected. The in-graph executor refuses an attempt past `max_retries + 1`.
 
-# Set an explicit run ID, disable export, or configure another local endpoint
-uv run agentic-dev-workflow workflow-demo --scenario success --run-id demo-001 --no-tracing
-uv run agentic-dev-workflow workflow-demo --otlp-endpoint http://localhost:4318/v1/traces
+**Verification errors.** A failed test is a `fail` and may be repaired. A runner that cannot execute the check is an `error`. Errors include unavailable sandbox, launch failure, timeout, output overflow, and uncertain cleanup. The decision step does not send an error back to the executor.
 
-# Durable mock run; pause/resume as shown above
-uv run agentic-dev-workflow workflow-demo --durable --run-id durable-demo
+## Engineering tradeoffs
 
-# Select a repository explicitly for read-only preflight
-uv run agentic-dev-workflow preflight --repository /path/to/repository
+**Process-local HMAC.** The key is 32 random bytes created when the orchestration module loads. A saved checkpoint from another process will not verify, because that process has a different key. That is the cost of refusing to trust caller-edited `pass` and `approve` fields. Code that can read module globals in the same process can also read the key and call the signer. The bindings are an integrity check on checkpoint data, not a privilege boundary inside the interpreter.
 
-# Verify an explicitly selected Git baseline (read-only)
-uv run agentic-dev-workflow baseline-check \
-  --repository /path/to/disposable-repository \
-  --base-commit <full-40-or-64-character-commit-id>
+**SQLite single writer.** Durable mock runs and any orchestration caller that opens the SQLite helper share LangGraph’s `SqliteSaver`. The helper creates a private directory mode and a database file for one serial user. Two processes using the same database are outside the supported use. The busy timeout bounds a lock wait. It does not coordinate two workflows.
 
-# Explicitly create, then explicitly clean up, a managed worktree
-uv run agentic-dev-workflow worktree --action create \
-  --source-repository /path/to/disposable-repository \
-  --base-commit <full-commit-id> --run-id demo-001 \
-  --worktree-root /path/to/runner-owned/worktrees
-uv run agentic-dev-workflow worktree --action cleanup \
-  --source-repository /path/to/disposable-repository \
-  --base-commit <full-commit-id> --run-id demo-001 \
-  --worktree-root /path/to/runner-owned/worktrees
-```
+**Git inventory blind spots.** Ignored files are outside `git status` and are not requested. With `core.fileMode=false`, a chmod-only change is invisible. The snapshot is one read, not a freeze: a concurrent same-user process can change the worktree while the status command runs. Copy detection is not requested from Git. Copy records are still parsed if they appear, and both ends must be approved. A filename that looks like a porcelain record in the rename-source position fails closed instead of being guessed.
 
-`workflow-demo` does not load repository configuration and never accesses the
-Dashboard path. It prints a concise JSON summary and exits 0 on simulated
-success, 1 on simulated verification failure, and 2 for invalid options.
-`--no-tracing` suppresses telemetry export. If enabled, graph and node spans
-use the `agentic-dev-workflow` service and include run ID, phase, node, attempt,
-outcome, and mock-mode attributes. Specification text, plan content, source,
-diffs, credentials, and environment values are not span attributes. Search
-Jaeger for `workflow.mock-run` and inspect its child spans.
+**No operating-system sandbox.** The registry’s executable paths are absolute paths for a future `runner-verification-v1` image profile. Nothing in this tree pulls an image, starts a container, or applies a kernel sandbox. `DeterministicFakeSandboxRunner` returns scripted `SandboxCheckResult` values. `UnavailableSandboxRunner` returns a fixed infrastructure error and does not launch a process. `VerifiedWorktree` is an in-process contract. It does not stop a same-user process from swapping a path after the handle is built.
 
-## Controlled Codex CLI adapter (Phase 3B-3)
+## Testing
 
-The installed CLI was inspected locally and reported `codex-cli 0.163.0`.
-Its `codex exec --help` confirms non-interactive execution, `--cd`,
-`--sandbox read-only|workspace-write`, `--ask-for-approval on-request`,
-`--json`, and `--output-schema`. It also supports `--oss --local-provider
-ollama`. This adapter pins runtime acceptance to that exact version and fails
-closed for missing, unlaunchable, or different versions. Recheck the installed
-help and review the adapter before upgrading Codex.
+A local run of `unittest` discovery over `tests/` in this working tree finished with 292 tests passing. The same run printed two `ResourceWarning` lines for an unclosed `sqlite3` connection while an inventory test forced garbage collection. The tests passed. That warning is not yet traced to a product leak.
 
-Every adapter run uses local Ollama mode, an isolated temporary Codex home,
-`--ignore-user-config`, `--ephemeral`, no web search, and a minimal child
-environment that excludes caller credentials and API-key variables. Set
-`AGENTIC_DEV_WORKFLOW_CODEX_EXECUTABLE` to an absolute, normalized executable
-path; the adapter does not search ambient `PATH` for Codex. Planner
-and reviewer roles use the `read-only` sandbox; executor uses `workspace-write`.
-Every role requests `on-request` approval. It never uses bypass flags, adds
-directories, or accepts an executable, working directory, sandbox, approval
-setting, or command arguments from the request. The request prompt is sent on
-stdin and is not written to logs or telemetry. An absolute path and matching
-version string do not authenticate the binary: the configured file, its
-interpreter/runtime, and command resolution through the child `PATH` remain
-local trust assumptions.
+The suite locks in the behavior above with direct assertions, including:
 
-The CLI help does not provide an execution timeout option. The Python wrapper
-uses one deadline for version probing and agent execution, with bounded
-termination and stream-cleanup grace. It terminates the Codex process group on
-POSIX; on Windows it fails closed because this implementation cannot verify
-process-tree cleanup. POSIX cleanup kills descendants that remain in the
-Codex process group; a process that deliberately creates a new session can
-escape that group, so this is not a substitute for an OS sandbox. It caps
-combined stdout/stderr capture at 1 MiB by default
-(constructor limits: 1 KiB through 16 MiB). It parses JSONL completion events
-and validates a bounded Codex-specific response with exactly `summary` and
-`items` fields. The structured message is limited to 64 KiB; summaries to 2,048
-characters; and items to 64 strings of at most 512 characters each. The
-generic `AgentResult.structured_output` mapping contract is unchanged, but the
-Codex response shape is intentionally narrower than the earlier arbitrary
-object. The schema constrains shape and size only; it does not detect secrets.
-Returned structured values are model-generated, untrusted, and potentially
-sensitive. Full JSONL output and stderr are not returned; rejected-output
-diagnostics and telemetry omit their values.
+- A clean success records `runner.tests` passed and `runner.lock-check` skipped.
+- One failed check, one repair, and a second pass ends `success` with two executor calls.
+- Persistent failure at a retry limit of one ends `failed` with `retries_exhausted` and does not call the executor a third time.
+- Missing or wider approval does not execute.
+- A rename endpoint outside the approval stops before the sandbox.
+- `UnavailableSandboxRunner` is an error and is not retried.
+- A checkpoint paused before execution, then edited to claim attempt 1 and `verify`, cannot resume as success.
+- Rewriting an earlier history entry after a real failure and a real later pass is rejected.
+- Forged `pass` and `approve` fields, including a structurally consistent verifier payload with bogus binding hex, are rejected before side effects.
+- A scope failure on the repair attempt clears the current checks and records `not_run` for that attempt, while attempt 1 keeps its passed checks in history.
+- A deep-copied complete inventory and a reader snapshot aimed at another repository cannot satisfy the lock check.
+- Constructing or returning a passed result above the check’s output cap is rejected.
 
-Executor runs use strict CLI configuration overrides to disable workspace
-network access, set additional writable roots to an empty list, and exclude
-`/tmp` and `TMPDIR` from workspace writes. Startup update checks and Codex
-analytics are also disabled. These CLI sandbox settings constrain Codex's
-execution environment; they are not a complete host security boundary. The
-sandbox and analytics keys are listed in the
-[Codex configuration reference](https://developers.openai.com/codex/config-reference).
+`tests/test_demo_orchestration.py` runs the three walkthrough scenarios through the demo script and checks outcomes, attempt counts, and history.
 
-The prompt asks Codex not to commit, merge, deploy, access production databases,
-or perform destructive cleanup. These instructions are advisory. Python
-validates that corresponding policy flags are false, but this phase does not
-independently block those actions. `on-request` approval and the CLI sandbox
-remain Codex controls, not a separate runner approval UI or OS sandbox.
+## Current status
 
-Codex execution requires `AGENTIC_DEV_WORKFLOW_CODEX_ENABLED=true` through
-validated configuration and direct construction of `CodexCLIAdapter` with an
-`ExecutionPolicy` and `WorktreeManager`. The adapter then verifies the clean
-source baseline, manager ownership record, linked Git worktree, selected
-commit, and run ID before launch. Worktree checks are repeated after the
-version probe, but are not race-free against a concurrent same-user process.
-The manifest and marker prevent accidental reuse, not a malicious same-user
-process. Strong isolation requires an OS sandbox or stronger architecture.
-No existing CLI command or LangGraph node
-constructs it, so opt-in configuration alone does not start an agent.
+Two graphs live in the tree.
 
-Tests exercise process handling with a fake Codex executable and temporary
-Git fixtures only. They do not invoke the installed Codex agent or call a
-model. The installed adapter is deliberately not run against an application
-repository in this phase. Local Ollama inference avoids a paid model API, but
-requires an available local Ollama service and compatible model; hardware and
-electricity costs still apply. The Codex sandbox and Git worktree are not a
-complete OS security sandbox, and configured Git filters remain a concern.
+The mock graph in `mock_workflow` simulates planner, executor, and verifier results. `workflow-demo` calls `run_mock_workflow`. It can pause after planning, resume from SQLite, and export OpenTelemetry spans. Span attributes include run id, phase, node, attempt, mock mode, and outcome. The preflight span can also record whether the repository is clean. Spans do not carry the specification text or sandbox output. The CLI demo does not invoke the orchestration graph.
 
-## Git baseline verification and worktrees (Phase 3B-2)
+The orchestration graph is `run_orchestration`. Tests and `scripts/demo_orchestration.py` call it with mock adapters and a scripted runner. It has no OpenTelemetry instrumentation. Its default checkpoint saver is in memory.
 
-`baseline-check` requires an explicit source repository and full commit ID. It
-resolves the repository and selected commit, reports the current HEAD and
-staged, unstaged, and untracked paths, and rejects a dirty source by default.
-It is read-only. Git calls use argument lists, an explicit working directory,
-bounded timeouts, and bounded diagnostic output; command output is not printed.
-Git subprocesses also ignore inherited `GIT_DIR`/worktree/index overrides and
-disable optional index refreshes.
+Other commands on the CLI are diagnostics and explicit Git operations: `doctor`, `preflight`, `trace-smoke`, `run`, `baseline-check`, and `worktree`. `run` is a dry-run preflight. The worktree command is the only CLI path that creates or cleans a temporary worktree, and only when the caller passes an explicit source, base commit, run id, and runner-owned root. The Codex adapter included here is a disabled placeholder. Tests that cover the adapter use a fake executable.
 
-The `worktree` command requires an explicit `create` or `cleanup` action, source
-repository, full base commit, safe run ID, and absolute runner-owned root. It
-generates the destination itself as `agentic-workflow-<run-id>`, refuses dirty
-baselines and existing/unowned destinations, and verifies the detached HEAD,
-Git common directory, registration, and clean status. Cleanup requires the
-root ownership marker, a matching per-run record, Git registration, and a
-clean worktree; it never force-removes or recursively deletes a caller path.
-Failed creation is reported with partial-state information and is not
-automatically cleaned up.
+The sandbox in this repository is a contract plus those two test runners. It is not an isolated execution environment.
 
-Path validation and ownership verification are distinct: absolute/canonical
-path checks identify where a destination resolves, while the manager record
-and Git's worktree registry establish that it was registered for the given
-source and run. These local records protect against accidental reuse, not a
-hostile user who can rewrite both records. Creating/removing a linked worktree
-necessarily changes Git administrative metadata in the source repository's
-common Git directory; this runner verifies that source files, index, HEAD,
-refs, and status remain unchanged/clean. It does not claim that a Git worktree
-is an OS security sandbox.
-Git checkout can still invoke repository-configured filters. The worktree
-manager disables Git hooks, but callers should use only trusted repositories
-until those checkout operations run under a reviewed OS sandbox.
+## Roadmap
 
-All integration tests create temporary Git repositories. No real user project
-is used by these tests. The Dashboard is outside this phase's code and test
-scope. Phase 3B-2 had no real Codex adapter; Phase 3B-3 adds one that remains
-opt-in and disconnected from the CLI and LangGraph. Before autonomous workflow
-execution, a later phase must add explicit approval UX, independent OS sandbox
-enforcement, bounded orchestration/retries, and review of worktree changes.
+Implemented now:
 
-## Jaeger
+- Validated planner, executor, verifier, and reviewer outputs.
+- Exact approval, Git inventory, and approved-scope checks inside the orchestration graph.
+- Registry checks, output caps, and repository-bound lock-check applicability.
+- Bounded repair, checkpoint resume, and process-local evidence bindings.
+- A deterministic three-scenario demo and the mock graph with SQLite pause/resume and tracing.
 
-The existing local Jaeger v2.22.0 setup can be started with:
+Planned, and not in the tree:
 
-```bash
-docker run --rm --name agentic-jaeger \
-  -p 16686:16686 -p 4317:4317 -p 4318:4318 \
-  cr.jaegertracing.io/jaegertracing/jaeger:2.22.0
-```
+- A sandbox backend that binds `runner-verification-v1` to a reviewed local image digest and enforces an operating-system sandbox.
+- A model adapter that stays behind the existing explicit opt-in, still unable to approve its own scope.
+- A CLI path that runs `run_orchestration` rather than only the mock graph.
+- A checkpoint format bump if older orchestration files need an error distinct from “incomplete.”
 
-Open <http://localhost:16686>. The default trace endpoint is
-`http://localhost:4318/v1/traces`. Use `--no-tracing` for an offline demo.
+## Technology
 
-## Safety and limitations
-
-- Phase 3A does not access, inspect, or modify the Dashboard repository.
-- Existing CLI commands and LangGraph workflows do not invoke Codex or a model.
-  The separate adapter can only run after explicit validated opt-in and
-  direct construction; this phase's tests use a fake executable and no model.
-  No agent shell task or real verification is wired into autonomous workflow
-  execution, and there is no automated commit. The Phase 3B-2 worktree command
-  remains the only CLI Git mutation.
-- `run` remains a dry-run/preflight command only. Future implementation must
-  require an explicitly selected base commit and use a separate worktree.
-- `doctor` checks local tools and endpoint reachability; it does not verify
-  model access, account entitlements, license terms, or API billing.
-- Jaeger all-in-one uses volatile local storage. Traces are for local
-  development, not durable retention.
-- The standalone `trace_smoke_test.py` remains available as an exporter check.
+The implementation is Python 3.14. Workflow state uses LangGraph’s `StateGraph`. In-memory checkpoints use `InMemorySaver`. Durable checkpoints use `langgraph-checkpoint-sqlite` 3.1.2 through a local SQLite helper. The mock graph, doctor, preflight, and trace-smoke paths use the OpenTelemetry API and SDK, with an OTLP HTTP exporter when a caller supplies an endpoint. Git inventory shells out to `git` with an argument vector and parses porcelain v2. Tests are `unittest`. Direct dependencies are declared in `pyproject.toml` and locked in `uv.lock`.

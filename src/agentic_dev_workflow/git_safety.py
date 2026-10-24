@@ -429,6 +429,11 @@ def run_git_command(
     )
 
 
+def git_environment() -> dict[str, str]:
+    """Return a Git environment with inherited repository/config overrides removed."""
+    return _git_environment()
+
+
 def _truncate(value: str, limit: int = MAX_GIT_OUTPUT_CHARS) -> tuple[str, bool]:
     if len(value) <= limit:
         return value, False
@@ -464,8 +469,11 @@ def _is_finite_number(value: int | float) -> bool:
 
 
 def _git_environment() -> dict[str, str]:
-    """Prevent inherited repository overrides and optional index writes."""
+    """Prevent inherited repository/configuration overrides and index writes."""
     environment = os.environ.copy()
+    for name in list(environment):
+        if name == "GIT_CONFIG" or name.startswith("GIT_CONFIG_"):
+            environment.pop(name, None)
     for name in (
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -476,9 +484,11 @@ def _git_environment() -> dict[str, str]:
         "GIT_NAMESPACE",
         "GIT_PREFIX",
         "GIT_CEILING_DIRECTORIES",
-        "GIT_CONFIG_PARAMETERS",
     ):
         environment.pop(name, None)
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_SYSTEM"] = os.devnull
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     environment["GIT_TERMINAL_PROMPT"] = "0"
     return environment

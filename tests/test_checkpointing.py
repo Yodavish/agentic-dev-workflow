@@ -10,6 +10,7 @@ import tempfile
 import time
 import textwrap
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -129,11 +130,12 @@ class CheckpointStorageTests(unittest.TestCase):
                 graph.invoke(create_initial_state("Private test spec", run_id=run_id), config)
 
             database = data_dir / "checkpoints.sqlite3"
-            with sqlite3.connect(database) as connection:
-                connection.execute(
-                    "UPDATE checkpoints SET checkpoint = ? WHERE thread_id = ?",
-                    (b"malformed checkpoint bytes", thread_id),
-                )
+            with closing(sqlite3.connect(database)) as connection:
+                with connection:
+                    connection.execute(
+                        "UPDATE checkpoints SET checkpoint = ? WHERE thread_id = ?",
+                        (b"malformed checkpoint bytes", thread_id),
+                    )
             with open_sqlite_checkpointer(data_dir, require_existing=True) as saver:
                 graph = build_mock_graph(checkpointer=saver)
                 with self.assertRaisesRegex(ValueError, "could not be read") as raised:
@@ -144,11 +146,12 @@ class CheckpointStorageTests(unittest.TestCase):
                         spec_text="Private test spec",
                     )
                 self.assertNotIn("Private test spec", str(raised.exception))
-            with sqlite3.connect(database) as connection:
-                payloads = connection.execute(
-                    "SELECT checkpoint FROM checkpoints WHERE thread_id = ?",
-                    (thread_id,),
-                ).fetchall()
+            with closing(sqlite3.connect(database)) as connection:
+                with connection:
+                    payloads = connection.execute(
+                        "SELECT checkpoint FROM checkpoints WHERE thread_id = ?",
+                        (thread_id,),
+                    ).fetchall()
             self.assertTrue(payloads)
             self.assertTrue(all(row[0] == b"malformed checkpoint bytes" for row in payloads))
 
