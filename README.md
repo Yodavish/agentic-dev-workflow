@@ -38,6 +38,43 @@ A checkpoint may pause before execution, verification, review, or the decision. 
 
 **Approval.** The caller passes a `ScopeApproval` tuple. The approved paths must equal the proposed set. A missing approval ends at `awaiting_approval`. A wider or narrower set ends at `scope_mismatch`. Approval is a human decision recorded by the caller. The inventory module does not grant it.
 
+**Task input.** `load_task_specification` accepts an inline string, a spec file, or both when the file bytes equal the inline string. A missing source, whitespace-only text, and two different texts raise `ValueError` before the graph starts. The same string is stored as `spec_text`, sent to the planner as its task, and placed in the executor and reviewer context under `specification`. Retries and checkpoint resume keep that string. The published orchestration report does not copy it. `run_orchestration` still accepts the resolved string directly, so a caller that already loaded `SPEC.md` does not change.
+
+A multiline inline task:
+
+```text
+Create greeting.py with greet(name) returning "Hello, {name}!".
+Create tests/test_greeting.py for a normal name and an empty string.
+Use only runner.tests.
+```
+
+`scripts/live_cursor_feature.py` is the disposable-repository runner. It refuses a repository outside `/tmp/agentic-feature-test-*`. `--task` passes the inline text. With no `--task`, an existing `SPEC.md` in that repository is still the specification. `--approve PATH` may be repeated and is the only approval; omit it and the run stops at `awaiting_approval`. The runner does not approve the planner's proposed paths by itself. `runner.tests` discovers modules under `tests/`, so a root-level test module is not the registered check. `runner.compile` expects both `src/` and `tests/`.
+
+Greeting demo, without creating `SPEC.md`, after an empty Git commit in a disposable feature repository:
+
+```bash
+AGENTIC_RUN_ID=greet01 \
+AGENTIC_REPORT_PATH=/tmp/agentic-feature-test-greeting/live-run-report.json \
+.venv/bin/python scripts/live_cursor_feature.py \
+  --repository /tmp/agentic-feature-test-greeting/feature \
+  --task "$(cat <<'EOF'
+Create greeting.py with greet(name) returning "Hello, {name}!".
+Create tests/test_greeting.py.
+Test greet("Ada") and greet("").
+Change only those two files.
+verification_check_ids must be exactly runner.tests.
+EOF
+)" \
+  --approve greeting.py \
+  --approve tests/test_greeting.py
+```
+
+The approved names are the caller's allowed set. If the planner proposes any other path, the run stops with `scope_mismatch` and does not edit the worktree.
+
+**Run summary.** Every orchestration report includes `summary`. A live report also includes `run_summary`, rebuilt from the sanitized planning report, agent calls, and Jaeger trace id. The summary gives the outcome, run id, wall-clock elapsed time, verification status, approval status, retries, scope-violation codes, and the stop reason. Each agent row separates wall-clock duration from the CLI `duration_ms`. Token totals add each invocation once. Cache read and cache write stay separate from input tokens. A missing counter is `unavailable`, not zero. A partial snapshot stays `partial` and does not become a token total.
+
+The installed Cursor CLI prints a display name such as `Auto` and four token counters. It does not print a provider model id, a price, or a skill event. Model identity, cost, and skill status stay `unavailable`. The summary does not estimate a price from tokens. An actual cost is recorded only when a provider supplies one. `usage_by_run` remains the per-run counter aggregate. The workflow total sums those runs once and does not add the per-call rows again.
+
 **Executor.** The executor receives the approved paths and the current attempt. The graph counts every call in `executor_invocations`. It opens a verification attempt only when the executor output validates as completed. Invalid output is an error on that invocation, and the sandbox does not run.
 
 **Git change inventory.** After a completed executor result, the graph reads one `git status --porcelain=v2 -z` snapshot from the canonical worktree path on the verified handle. The read uses a scrubbed Git environment, a direct argument vector, a timeout, and an output cap. Staged, unstaged, and untracked changes are in scope. Both ends of a rename or copy count. The snapshot is a record of what Git reported. It is not an approval.

@@ -24,8 +24,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import secrets
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NotRequired, TypedDict
@@ -34,6 +36,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from agentic_dev_workflow.adapters import (
+    MAX_AGENT_TIMEOUT_SECONDS,
     AdapterError,
     AgentAdapter,
     AgentRequest,
@@ -59,6 +62,7 @@ from agentic_dev_workflow.git_inventory import (
     read_git_change_inventory,
     validate_approved_scope,
 )
+from agentic_dev_workflow.run_summary import build_run_summary
 from agentic_dev_workflow.sandbox import (
     MAX_RUN_ID_ATTEMPT,
     SandboxRunner,
@@ -157,9 +161,10 @@ class OrchestrationReport:
     errors: tuple[str, ...]
     proposed_paths: tuple[str, ...]
     attempt_history: tuple[dict[str, Any], ...]
+    elapsed_seconds: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "run_id": self.run_id,
             "outcome": self.outcome,
             "attempts": self.attempts,
@@ -172,7 +177,53 @@ class OrchestrationReport:
             "errors": list(self.errors),
             "proposed_paths": list(self.proposed_paths),
             "attempt_history": [_public_history(entry) for entry in self.attempt_history],
+            "elapsed_seconds": self.elapsed_seconds,
         }
+        payload["summary"] = build_run_summary(
+            run_id=self.run_id,
+            outcome=self.outcome,
+            elapsed_seconds=self.elapsed_seconds,
+            errors=list(self.errors),
+            checks=payload["checks"],
+            attempt_history=payload["attempt_history"],
+            repair_retries_used=self.repair_retries_used,
+            max_retries=self.max_retries,
+            executor_invocations=self.executor_invocations,
+        )
+        return payload
+
+
+def load_task_specification(
+    *,
+    inline: str | None = None,
+    spec_path: Path | None = None,
+) -> str:
+    """Return one task specification.
+
+    An inline string and a spec file may both be supplied only when their
+    contents are exactly equal. Different texts, a missing source, and
+    whitespace-only text are errors. The returned text is not logged.
+    """
+    if inline is not None and not isinstance(inline, str):
+        raise ValueError("inline task must be a string")
+    file_text: str | None = None
+    if spec_path is not None:
+        path = spec_path if isinstance(spec_path, Path) else Path(spec_path)
+        if not path.is_file():
+            raise ValueError("spec file does not exist")
+        file_text = path.read_text(encoding="utf-8")
+        if not file_text.strip():
+            raise ValueError("spec file must not be empty")
+    if inline is not None and not inline.strip():
+        raise ValueError("inline task must not be empty")
+    if inline is None and file_text is None:
+        raise ValueError("task specification is missing")
+    if inline is not None and file_text is not None and inline != file_text:
+        raise ValueError("inline task and spec file disagree")
+    chosen = inline if inline is not None else file_text
+    if not isinstance(chosen, str) or not chosen.strip():
+        raise ValueError("task specification is missing")
+    return chosen
 
 
 def run_orchestration(
@@ -189,6 +240,7 @@ def run_orchestration(
     checkpointer: Any | None = None,
     interrupt_before: list[str] | None = None,
     resume: bool = False,
+    agent_timeout_seconds: float = 30,
 ) -> OrchestrationReport:
     """Run or resume one controlled workflow on a verified worktree handle."""
     repository_root = _canonical_worktree_root(worktree)
@@ -197,6 +249,7 @@ def run_orchestration(
     if selected_run_id != worktree.run_id:
         raise ValueError("worktree run_id does not match the workflow run")
     _validate_max_retries(max_retries)
+    _validate_agent_timeout(agent_timeout_seconds)
     if not isinstance(spec_text, str) or not spec_text.strip():
         raise ValueError("spec_text must not be empty")
     if approval is not None and type(approval) is not ScopeApproval:
@@ -215,12 +268,14 @@ def run_orchestration(
         sandbox=sandbox,
         checkpointer=saver,
         interrupt_before=interrupt_nodes,
+        agent_timeout_seconds=float(agent_timeout_seconds),
     )
     config = {
         "configurable": {
             "thread_id": f"agentic-dev-workflow:orchestration:{selected_run_id}"
         }
     }
+    started = time.monotonic()
     if resume:
         state = _resume(
             graph,
@@ -250,7 +305,7 @@ def run_orchestration(
     outcome = "paused" if snapshot.next else state["final_status"]
     if outcome == "running":
         raise ValueError("workflow stopped without a terminal outcome")
-    return _report(state, outcome=outcome)
+    return _report(state, outcome=outcome, elapsed_seconds=time.monotonic() - started)
 
 
 def _build_graph(
@@ -263,6 +318,7 @@ def _build_graph(
     sandbox: SandboxRunner,
     checkpointer: Any,
     interrupt_before: list[str] | None,
+    agent_timeout_seconds: float = 30,
 ) -> Any:
     def plan(state: OrchestrationState) -> dict[str, Any]:
         try:
@@ -273,6 +329,8 @@ def _build_graph(
                     AgentRole.PLANNER,
                     state["spec_text"].strip(),
                     {"phase": "plan"},
+                    timeout_seconds=agent_timeout_seconds,
+                    invocation=1,
                 ),
             )
         except AdapterError as error:
@@ -331,7 +389,11 @@ def _build_graph(
                         "approved_paths": list(state["approved_paths"]),
                         "attempt": attempt,
                         "plan": state["plan"],
+                        "specification": state["spec_text"],
                     },
+                    timeout_seconds=agent_timeout_seconds,
+                    invocation=invocations,
+                    attempt=attempt,
                 ),
             )
         except AdapterError as error:
@@ -346,10 +408,9 @@ def _build_graph(
         except AgentOutputValidationError as error:
             return _invoked(_terminal("error", error.diagnostic_code), invocations)
         if output.status != ExecutorOutcome.COMPLETED:
-            return _invoked(
-                _terminal("error", output.diagnostic_code or "executor_failed"),
-                invocations,
-            )
+            # The validated diagnostic_code is model text. Keep the workflow
+            # error on this control-flow outcome instead of publishing it.
+            return _invoked(_terminal("error", "executor_failed"), invocations)
         return {
             "execution_attempt": attempt,
             "executor_invocations": invocations,
@@ -486,7 +547,11 @@ def _build_graph(
                         "verification_outcome": outcome,
                         "evidence_refs": evidence_refs,
                         "attempt": state["execution_attempt"],
+                        "specification": state["spec_text"],
                     },
+                    timeout_seconds=agent_timeout_seconds,
+                    invocation=state["execution_attempt"],
+                    attempt=state["execution_attempt"],
                 ),
             )
         except AdapterError as error:
@@ -768,6 +833,19 @@ def _validate_run_id(run_id: str) -> None:
         raise ValueError("run_id must be 1-64 safe ASCII letters, digits, '_' or '-'")
 
 
+def _validate_agent_timeout(agent_timeout_seconds: float) -> None:
+    if (
+        not isinstance(agent_timeout_seconds, (int, float))
+        or isinstance(agent_timeout_seconds, bool)
+        or not math.isfinite(float(agent_timeout_seconds))
+        or agent_timeout_seconds <= 0
+        or agent_timeout_seconds > MAX_AGENT_TIMEOUT_SECONDS
+    ):
+        raise ValueError(
+            f"agent_timeout_seconds must be positive and at most {MAX_AGENT_TIMEOUT_SECONDS}"
+        )
+
+
 def _validate_max_retries(max_retries: int) -> None:
     if (
         not isinstance(max_retries, int)
@@ -797,14 +875,33 @@ def _checkpoint_exists(graph: Any, config: dict[str, Any]) -> bool:
 
 
 def _request(
-    run_id: str, role: AgentRole, task: str, context: dict[str, Any]
+    run_id: str,
+    role: AgentRole,
+    task: str,
+    context: dict[str, Any],
+    *,
+    timeout_seconds: float,
+    invocation: int,
+    attempt: int | None = None,
 ) -> AgentRequest:
+    if type(invocation) is not int or invocation < 1:
+        raise ValueError("invocation must be a positive integer")
+    metadata = {
+        "role": role.value,
+        "invocation": str(invocation),
+        "invocation_id": f"{role.value}:{invocation}",
+    }
+    if attempt is not None:
+        if type(attempt) is not int or attempt < 1:
+            raise ValueError("attempt must be a positive integer")
+        metadata["attempt"] = str(attempt)
     return AgentRequest(
         run_id=run_id,
         role=role,
         task=task,
         structured_context=context,
-        timeout_seconds=30,
+        timeout_seconds=timeout_seconds,
+        correlation_metadata=metadata,
     )
 
 
@@ -1222,7 +1319,9 @@ def _public_history(entry: dict[str, Any]) -> dict[str, Any]:
     return published
 
 
-def _report(state: OrchestrationState, *, outcome: str) -> OrchestrationReport:
+def _report(
+    state: OrchestrationState, *, outcome: str, elapsed_seconds: float | None = None
+) -> OrchestrationReport:
     checks = tuple(_public_check(check) for check in state["checks"])
     return OrchestrationReport(
         run_id=state["run_id"],
@@ -1241,4 +1340,5 @@ def _report(state: OrchestrationState, *, outcome: str) -> OrchestrationReport:
         errors=tuple(state["errors"]),
         proposed_paths=tuple(state["proposed_paths"]),
         attempt_history=tuple(_public_history(entry) for entry in state["attempt_history"]),
+        elapsed_seconds=elapsed_seconds,
     )

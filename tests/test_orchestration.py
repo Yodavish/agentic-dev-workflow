@@ -10,7 +10,12 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from agentic_dev_workflow.adapters import AgentResult, MockAgentAdapter
+from agentic_dev_workflow.adapters import (
+    AgentFailureCategory,
+    AgentResult,
+    AgentStatus,
+    MockAgentAdapter,
+)
 from agentic_dev_workflow.checkpointing import open_sqlite_checkpointer
 from agentic_dev_workflow.sandbox import (
     RUNNER_RUNTIME_PROFILE_ID,
@@ -96,9 +101,11 @@ class CountingAdapter:
     def __init__(self, structured_output: dict[str, object]) -> None:
         self.inner = MockAgentAdapter(structured_output=structured_output)
         self.calls = 0
+        self.requests = []
 
     def invoke(self, request: object) -> AgentResult:
         self.calls += 1
+        self.requests.append(request)
         return self.inner.invoke(request)
 
 
@@ -186,6 +193,7 @@ def run_case(
     interrupt_before=None,
     resume: bool = False,
     parent: Path | None = None,
+    spec_text: str = "Add a note",
 ):
     from agentic_dev_workflow.orchestration import ScopeApproval, run_orchestration
 
@@ -196,7 +204,7 @@ def run_case(
         reviewer = CountingAdapter(REVIEW)
         granted = None if approval is None else ScopeApproval(approval)
         report = run_orchestration(
-            spec_text="Add a note",
+            spec_text=spec_text,
             worktree=handle,
             planner=planner,
             executor=executor,
@@ -1282,6 +1290,314 @@ class OrchestrationIntegrityTests(unittest.TestCase):
             self.assertEqual(executor.calls, executor_calls)
             self.assertEqual(sandbox.calls, sandbox_calls)
             self.assertEqual(reviewer.calls, 2)
+
+    def test_requests_carry_distinct_invocation_identity_outside_the_prompt(self) -> None:
+        sandbox = ScriptedSandbox(
+            {
+                1: {
+                    CheckId.RUNNER_TESTS: sandbox_result(
+                        status=SandboxStatus.FAILED, run_id="demo-identity"
+                    )
+                },
+                2: {CheckId.RUNNER_TESTS: sandbox_result(run_id="demo-identity")},
+            }
+        )
+        _report, planner, executor, reviewer = run_case(
+            run_id="demo-identity",
+            sandbox=sandbox,
+            approval=("notes.txt",),
+            max_retries=1,
+        )
+        self.assertEqual(
+            planner.requests[0].correlation_metadata,
+            {"role": "planner", "invocation": "1", "invocation_id": "planner:1"},
+        )
+        self.assertEqual(planner.requests[0].structured_context, {"phase": "plan"})
+        self.assertEqual(
+            [request.correlation_metadata for request in executor.requests],
+            [
+                {
+                    "role": "executor",
+                    "attempt": "1",
+                    "invocation": "1",
+                    "invocation_id": "executor:1",
+                },
+                {
+                    "role": "executor",
+                    "attempt": "2",
+                    "invocation": "2",
+                    "invocation_id": "executor:2",
+                },
+            ],
+        )
+        self.assertEqual(
+            [request.correlation_metadata for request in reviewer.requests],
+            [
+                {
+                    "role": "reviewer",
+                    "attempt": "1",
+                    "invocation": "1",
+                    "invocation_id": "reviewer:1",
+                },
+                {
+                    "role": "reviewer",
+                    "attempt": "2",
+                    "invocation": "2",
+                    "invocation_id": "reviewer:2",
+                },
+            ],
+        )
+        for agent_request in (*planner.requests, *executor.requests, *reviewer.requests):
+            self.assertNotIn("invocation_id", agent_request.structured_context)
+            self.assertNotIn("correlation_metadata", agent_request.structured_context)
+        self.assertEqual(executor.requests[0].structured_context["attempt"], 1)
+        self.assertEqual(executor.requests[1].structured_context["attempt"], 2)
+        self.assertIsInstance(executor.requests[0].structured_context["attempt"], int)
+
+    def test_model_executor_diagnostics_do_not_become_workflow_errors(self) -> None:
+        from agentic_dev_workflow.orchestration import ScopeApproval, run_orchestration
+
+        for code in ("cursor_timeout", "output_field_invalid", "model_supplied_reason"):
+            with self.subTest(code=code):
+                sandbox = ScriptedSandbox(
+                    {1: {CheckId.RUNNER_TESTS: sandbox_result(run_id="demo-model-diag")}}
+                )
+                payload = dict(EXECUTOR)
+                payload["status"] = "failed"
+                payload["failure_category"] = "execution_failure"
+                payload["diagnostic_code"] = code
+                with tempfile.TemporaryDirectory() as directory:
+                    _root, handle = prepare_repository(Path(directory), "demo-model-diag")
+                    report = run_orchestration(
+                        spec_text="Add a note",
+                        worktree=handle,
+                        planner=CountingAdapter(PLAN),
+                        executor=MockAgentAdapter(structured_output=payload),
+                        reviewer=CountingAdapter(REVIEW),
+                        sandbox=sandbox,
+                        approval=ScopeApproval(("notes.txt",)),
+                        run_id="demo-model-diag",
+                    )
+                self.assertEqual(report.outcome, "error")
+                self.assertEqual(report.errors, ("executor_failed",))
+                self.assertNotIn(code, json.dumps(report.to_dict()))
+                self.assertEqual(sandbox.calls, [])
+
+    def test_adapter_timeout_remains_a_workflow_error(self) -> None:
+        from agentic_dev_workflow.orchestration import ScopeApproval, run_orchestration
+
+        sandbox = ScriptedSandbox(
+            {1: {CheckId.RUNNER_TESTS: sandbox_result(run_id="demo-adapter-timeout")}}
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            _root, handle = prepare_repository(Path(directory), "demo-adapter-timeout")
+            report = run_orchestration(
+                spec_text="Add a note",
+                worktree=handle,
+                planner=CountingAdapter(PLAN),
+                executor=MockAgentAdapter(
+                    status=AgentStatus.FAILED,
+                    failure_category=AgentFailureCategory.TIMEOUT,
+                    diagnostic_code="cursor_timeout",
+                ),
+                reviewer=CountingAdapter(REVIEW),
+                sandbox=sandbox,
+                approval=ScopeApproval(("notes.txt",)),
+                run_id="demo-adapter-timeout",
+            )
+        self.assertEqual(report.outcome, "error")
+        self.assertEqual(report.errors, ("cursor_timeout",))
+        self.assertEqual(report.executor_invocations, 1)
+        self.assertEqual(sandbox.calls, [])
+
+    def test_invalid_executor_diagnostic_stays_a_validation_error(self) -> None:
+        from agentic_dev_workflow.orchestration import ScopeApproval, run_orchestration
+
+        sandbox = ScriptedSandbox(
+            {1: {CheckId.RUNNER_TESTS: sandbox_result(run_id="demo-invalid-diag")}}
+        )
+        payload = dict(EXECUTOR)
+        payload["status"] = "failed"
+        payload["failure_category"] = "execution_failure"
+        payload["diagnostic_code"] = "Not a workflow code"
+        with tempfile.TemporaryDirectory() as directory:
+            _root, handle = prepare_repository(Path(directory), "demo-invalid-diag")
+            report = run_orchestration(
+                spec_text="Add a note",
+                worktree=handle,
+                planner=CountingAdapter(PLAN),
+                executor=MockAgentAdapter(structured_output=payload),
+                reviewer=CountingAdapter(REVIEW),
+                sandbox=sandbox,
+                approval=ScopeApproval(("notes.txt",)),
+                run_id="demo-invalid-diag",
+            )
+        self.assertEqual(report.outcome, "error")
+        self.assertEqual(report.errors, ("output_field_invalid",))
+        self.assertNotIn("Not a workflow code", json.dumps(report.to_dict()))
+        self.assertEqual(sandbox.calls, [])
+
+
+class InlineTaskTests(unittest.TestCase):
+    SPEC = "Create greeting.py.\nCover an empty name.\n"
+
+    def test_inline_task_reaches_planning_execution_review_and_retry(self) -> None:
+        sandbox = ScriptedSandbox(
+            {
+                1: {
+                    CheckId.RUNNER_TESTS: sandbox_result(
+                        status=SandboxStatus.FAILED, run_id="inline-task"
+                    )
+                },
+                2: {CheckId.RUNNER_TESTS: sandbox_result(run_id="inline-task")},
+            }
+        )
+        report, planner, executor, reviewer = run_case(
+            run_id="inline-task",
+            sandbox=sandbox,
+            approval=("notes.txt",),
+            max_retries=1,
+            spec_text=self.SPEC,
+        )
+        self.assertEqual(report.outcome, "success")
+        self.assertEqual(planner.requests[0].task, self.SPEC.strip())
+        self.assertNotIn("SPEC.md", planner.requests[0].task)
+        for request in (*executor.requests, *reviewer.requests):
+            self.assertEqual(request.structured_context["specification"], self.SPEC)
+        self.assertEqual(len(executor.requests), 2)
+        self.assertGreaterEqual(len(reviewer.requests), 1)
+        self.assertNotIn(self.SPEC, json.dumps(report.to_dict()))
+
+    def test_spec_file_still_supplies_the_task(self) -> None:
+        from agentic_dev_workflow.orchestration import load_task_specification
+
+        with tempfile.TemporaryDirectory() as directory:
+            spec_path = Path(directory) / "SPEC.md"
+            spec_path.write_text(self.SPEC, encoding="utf-8")
+            loaded = load_task_specification(spec_path=spec_path)
+        self.assertEqual(loaded, self.SPEC)
+        sandbox = ScriptedSandbox(
+            {1: {CheckId.RUNNER_TESTS: sandbox_result(run_id="spec-file")}}
+        )
+        _report, planner, executor, _reviewer = run_case(
+            run_id="spec-file",
+            sandbox=sandbox,
+            approval=("notes.txt",),
+            spec_text=loaded,
+        )
+        self.assertEqual(planner.requests[0].task, self.SPEC.strip())
+        self.assertEqual(executor.requests[0].structured_context["specification"], self.SPEC)
+
+    def test_missing_and_whitespace_tasks_fail(self) -> None:
+        from agentic_dev_workflow.orchestration import load_task_specification
+
+        with self.assertRaises(ValueError):
+            load_task_specification()
+        with self.assertRaises(ValueError):
+            load_task_specification(inline=" \n\t")
+        with tempfile.TemporaryDirectory() as directory:
+            spec_path = Path(directory) / "SPEC.md"
+            spec_path.write_text(" \n", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_task_specification(spec_path=spec_path)
+
+    def test_conflicting_inline_and_file_tasks_are_rejected(self) -> None:
+        from agentic_dev_workflow.orchestration import load_task_specification
+
+        with tempfile.TemporaryDirectory() as directory:
+            spec_path = Path(directory) / "SPEC.md"
+            spec_path.write_text(self.SPEC, encoding="utf-8")
+            with self.assertRaises(ValueError) as caught:
+                load_task_specification(inline="A different task.\n", spec_path=spec_path)
+            self.assertNotIn("different task", str(caught.exception))
+            self.assertEqual(
+                load_task_specification(inline=self.SPEC, spec_path=spec_path),
+                self.SPEC,
+            )
+
+    def test_inline_task_does_not_widen_approved_scope(self) -> None:
+        sandbox = ScriptedSandbox(
+            {1: {CheckId.RUNNER_TESTS: sandbox_result(run_id="inline-scope")}}
+        )
+        report, _planner, executor, reviewer = run_case(
+            run_id="inline-scope",
+            sandbox=sandbox,
+            approval=("notes.txt",),
+            extra_file="extra.txt",
+            spec_text=self.SPEC,
+        )
+        self.assertEqual(report.outcome, "failed")
+        self.assertEqual(report.errors, ("out_of_scope",))
+        self.assertEqual(executor.calls, 1)
+        self.assertEqual(reviewer.calls, 0)
+        self.assertEqual(sandbox.calls, [])
+        summary = report.to_dict()["summary"]
+        self.assertEqual(summary["verification_status"], "not_run")
+        self.assertEqual(summary["stop_reason"], "out_of_scope")
+        self.assertEqual(summary["scope_violations"], ["out_of_scope"])
+        self.assertEqual(summary["elapsed_seconds"]["status"], "reported")
+        self.assertIsInstance(summary["elapsed_seconds"]["value"], float)
+        self.assertEqual(summary["usage"]["workflow"]["counters"]["input_tokens"]["status"], "unavailable")
+        self.assertIsNone(summary["usage"]["workflow"]["counters"]["input_tokens"]["value"])
+        self.assertNotIn(self.SPEC, json.dumps(summary))
+
+    def test_checkpoint_keeps_the_inline_specification(self) -> None:
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        from agentic_dev_workflow.orchestration import ScopeApproval, run_orchestration
+
+        sandbox = ScriptedSandbox(
+            {1: {CheckId.RUNNER_TESTS: sandbox_result(run_id="inline-checkpoint")}}
+        )
+        saver = InMemorySaver()
+        with tempfile.TemporaryDirectory() as directory:
+            _root, handle = prepare_repository(Path(directory), "inline-checkpoint")
+            planner = CountingAdapter(PLAN)
+            executor = CountingAdapter(EXECUTOR)
+            reviewer = CountingAdapter(REVIEW)
+            approval = ScopeApproval(("notes.txt",))
+            paused = run_orchestration(
+                spec_text=self.SPEC,
+                worktree=handle,
+                planner=planner,
+                executor=executor,
+                reviewer=reviewer,
+                sandbox=sandbox,
+                approval=approval,
+                run_id="inline-checkpoint",
+                checkpointer=saver,
+                interrupt_before=["execute"],
+            )
+            self.assertEqual(paused.outcome, "paused")
+            with self.assertRaises(ValueError) as caught:
+                run_orchestration(
+                    spec_text="A different task.\n",
+                    worktree=handle,
+                    planner=planner,
+                    executor=executor,
+                    reviewer=reviewer,
+                    sandbox=sandbox,
+                    approval=approval,
+                    run_id="inline-checkpoint",
+                    checkpointer=saver,
+                    resume=True,
+                )
+            self.assertIn("specification", str(caught.exception))
+            finished = run_orchestration(
+                spec_text=self.SPEC,
+                worktree=handle,
+                planner=planner,
+                executor=executor,
+                reviewer=reviewer,
+                sandbox=sandbox,
+                approval=approval,
+                run_id="inline-checkpoint",
+                checkpointer=saver,
+                resume=True,
+            )
+        self.assertEqual(finished.outcome, "success")
+        self.assertEqual(executor.requests[0].structured_context["specification"], self.SPEC)
+        self.assertNotIn(self.SPEC, json.dumps(finished.to_dict()))
 
 
 if __name__ == "__main__":
